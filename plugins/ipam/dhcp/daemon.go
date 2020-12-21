@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 
 	"github.com/containernetworking/cni/pkg/skel"
@@ -43,27 +44,55 @@ type DHCP struct {
 	hostNetnsPrefix string
 }
 
+type DHCPEnv struct {
+	types.CommonArgs
+	K8S_POD_NAME               types.UnmarshallableString
+	K8S_POD_NAMESPACE          types.UnmarshallableString
+	K8S_POD_INFRA_CONTAINER_ID types.UnmarshallableString
+}
+
 func newDHCP() *DHCP {
 	return &DHCP{
 		leases: make(map[string]*DHCPLease),
 	}
 }
 
-func generateClientID(containerID string, netName string, ifName string) string {
-	return containerID + "/" + netName + "/" + ifName
+func generateClientID(conf *types.NetConf, dhcpEnv *DHCPEnv) string {
+	return strings.Join([]string{conf.Name, string(dhcpEnv.K8S_POD_NAMESPACE), string(dhcpEnv.K8S_POD_NAME)}, "/")
+}
+
+func loadCmdArgs(args *skel.CmdArgs) (*types.NetConf, *DHCPEnv, error) {
+	conf := types.NetConf{}
+	if err := json.Unmarshal(args.StdinData, &conf); err != nil {
+		return nil, nil, fmt.Errorf("error parsing netConf: %v", err)
+	}
+
+	dhcpEnv := DHCPEnv{}
+	if args.Args != "" {
+		err := types.LoadArgs(args.Args, &dhcpEnv)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return &conf, &dhcpEnv, nil
 }
 
 // Allocate acquires an IP from a DHCP server for a specified container.
 // The acquired lease will be maintained until Release() is called.
 func (d *DHCP) Allocate(args *skel.CmdArgs, result *current.Result) error {
-	conf := types.NetConf{}
-	if err := json.Unmarshal(args.StdinData, &conf); err != nil {
-		return fmt.Errorf("error parsing netconf: %v", err)
+	conf, dhcpEnv, err := loadCmdArgs(args)
+	if err != nil {
+		return err
 	}
 
-	clientID := generateClientID(args.ContainerID, conf.Name, args.IfName)
+	clientID := generateClientID(conf, dhcpEnv)
 	hostNetns := d.hostNetnsPrefix + args.Netns
-	l, err := AcquireLease(clientID, hostNetns, args.IfName)
+	hostName := string(dhcpEnv.K8S_POD_NAME) + "." + string(dhcpEnv.K8S_POD_NAMESPACE)
+	if conf.DNS.Domain != "" {
+		hostName += "." + hostName
+	}
+	l, err := AcquireLease(clientID, hostName, hostNetns, args.IfName)
 	if err != nil {
 		return err
 	}
@@ -89,12 +118,12 @@ func (d *DHCP) Allocate(args *skel.CmdArgs, result *current.Result) error {
 // Release stops maintenance of the lease acquired in Allocate()
 // and sends a release msg to the DHCP server.
 func (d *DHCP) Release(args *skel.CmdArgs, reply *struct{}) error {
-	conf := types.NetConf{}
-	if err := json.Unmarshal(args.StdinData, &conf); err != nil {
-		return fmt.Errorf("error parsing netconf: %v", err)
+	conf, dhcpEnv, err := loadCmdArgs(args)
+	if err != nil {
+		return err
 	}
 
-	clientID := generateClientID(args.ContainerID, conf.Name, args.IfName)
+	clientID := generateClientID(conf, dhcpEnv)
 	if l := d.getLease(clientID); l != nil {
 		l.Stop()
 		d.clearLease(clientID)
